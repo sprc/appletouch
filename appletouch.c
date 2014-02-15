@@ -340,8 +340,8 @@ static int atp_calculate_abs(int *xy_sensors, int nb_sensors, int fact,
 			     int *z, int *fingers)
 {
 	int i, k;
-	int smooth[nb_sensors + 2];
-	int smooth_tmp[nb_sensors + 2];
+	int smooth[nb_sensors];
+	int smooth_tmp[nb_sensors];
 
 	/* values to calculate mean */
 	int pcum = 0, psum = 0;
@@ -358,25 +358,24 @@ static int atp_calculate_abs(int *xy_sensors, int nb_sensors, int fact,
 
 	for (i = 0; i < nb_sensors; i++) {           /* Scale up to minimize */
 		smooth[i] = xy_sensors[i] << 12;     /* rounding/truncation. */
+		//printk(KERN_DEBUG "%3d: %3d\n", i, smooth[i]);
 	}
 
-	/* Mitigate some of the data loss from smoothing on the edge sensors. */
-	smooth[-1] = smooth[0] >> 2;
-	smooth[nb_sensors] = smooth[nb_sensors - 1] >> 2;
-
 	for (k = 0; k < 4; k++) {
-		for (i = 0; i < nb_sensors; i++) {   /* Blend with neighbors. */
+
+		smooth_tmp[0] = (smooth[0] * 3 + smooth[1]) >> 2;
+
+		for (i = 1; i < nb_sensors-1; i++) {   /* Blend with neighbors. */
 			smooth_tmp[i] = (smooth[i - 1] + smooth[i] * 2 + smooth[i + 1]) >> 2;
 		}
+
+		smooth_tmp[nb_sensors - 1] = (smooth[nb_sensors - 1] * 3 + smooth[nb_sensors - 2]) >> 2;
 
 		for (i = 0; i < nb_sensors; i++) {
 			smooth[i] = smooth_tmp[i];
 			if (k == 3)     /* Last go-round, so scale back down. */
 				smooth[i] = smooth[i] >> 12;  
 		}
-
-		smooth[-1] = smooth[0] >> 2;
-		smooth[nb_sensors] = smooth[nb_sensors - 1] >> 2;
 	}
 
 	for (i = 0; i < nb_sensors; i++) {
