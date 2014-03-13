@@ -49,7 +49,6 @@ struct atp_info {
 	int datalen;				/* size of USB transfers */
 	void (*callback)(struct urb *);		/* callback function */
 	int fuzz;				/* fuzz touchpad generates */
-	int threshold;				/* sensitivity threshold */
 };
 
 static void atp_complete_geyser_1_2(struct urb *urb);
@@ -64,7 +63,6 @@ static const struct atp_info fountain_info = {
 	.datalen	= 81,
 	.callback	= atp_complete_geyser_1_2,
 	.fuzz		= 16,
-	.threshold	= 5,
 };
 
 static const struct atp_info geyser1_info = {
@@ -76,7 +74,6 @@ static const struct atp_info geyser1_info = {
 	.datalen	= 81,
 	.callback	= atp_complete_geyser_1_2,
 	.fuzz		= 16,
-	.threshold	= 5,
 };
 
 static const struct atp_info geyser2_info = {
@@ -88,7 +85,6 @@ static const struct atp_info geyser2_info = {
 	.datalen	= 64,
 	.callback	= atp_complete_geyser_1_2,
 	.fuzz		= 0,
-	.threshold	= 3,
 };
 
 static const struct atp_info geyser3_info = {
@@ -99,7 +95,6 @@ static const struct atp_info geyser3_info = {
 	.datalen	= 64,
 	.callback	= atp_complete_geyser_3_4,
 	.fuzz		= 0,
-	.threshold	= 3,
 };
 
 static const struct atp_info geyser4_info = {
@@ -110,7 +105,6 @@ static const struct atp_info geyser4_info = {
 	.datalen	= 64,
 	.callback	= atp_complete_geyser_3_4,
 	.fuzz		= 0,
-	.threshold	= 3,
 };
 
 #define ATP_DEVICE(prod, info)					\
@@ -170,6 +164,12 @@ MODULE_DEVICE_TABLE(usb, atp_table);
 /* maximum pressure this driver will report */
 #define ATP_PRESSURE	300
 
+/*
+ * Threshold for the touchpad sensors. Any change less than ATP_THRESHOLD is
+ * ignored.
+ */
+#define ATP_THRESHOLD	 5
+
 /* Geyser initialization constants */
 #define ATP_GEYSER_MODE_READ_REQUEST_ID		1
 #define ATP_GEYSER_MODE_WRITE_REQUEST_ID	9
@@ -206,13 +206,13 @@ struct atp {
 	bool			valid;		/* are the samples valid? */
 	bool			size_detect_done;
 	bool			overflow_warned;
+	int			fingers_old;	/* last reported finger count */
 	int			x_old;		/* last reported x/y, */
 	int			y_old;		/* used for smoothing */
 	signed char		xy_cur[ATP_XSENSORS + ATP_YSENSORS];
 	signed char		xy_old[ATP_XSENSORS + ATP_YSENSORS];
 	int			xy_acc[ATP_XSENSORS + ATP_YSENSORS];
 	int			idlecount;	/* number of empty packets */
-	int			fingers_old;	/* last reported finger count */
 	struct work_struct	work;
 };
 
@@ -239,20 +239,14 @@ MODULE_AUTHOR("Sven Anders");
 MODULE_DESCRIPTION("Apple PowerBook and MacBook USB touchpad driver");
 MODULE_LICENSE("GPL");
 
-static int threshold = -1;
+/*
+ * Make the threshold a module parameter
+ */
+static int threshold = ATP_THRESHOLD;
 module_param(threshold, int, 0644);
 MODULE_PARM_DESC(threshold, "Discard any change in data from a sensor"
 			    " (the trackpad has many of these sensors)"
-			    " less than this value. Devices have defaults;"
-			    " this parameter overrides them.");
-static int fuzz = -1;
-
-module_param(fuzz, int, 0644);
-MODULE_PARM_DESC(fuzz, "Fuzz the trackpad generates. The higher"
-		       " this is, the less sensitive the trackpad"
-		       " will feel, but values too low may generate"
-		       " random movement. Devices have defaults;"
-		       " this parameter overrides them.");
+			    " less than this value.");
 
 static int debug;
 module_param(debug, int, 0644);
@@ -340,43 +334,15 @@ static int atp_calculate_abs(int *xy_sensors, int nb_sensors, int fact,
 			     int *z, int *fingers)
 {
 	int i, k;
-	int smooth[nb_sensors];
-	int smooth_tmp[nb_sensors];
+	int smooth[nb_sensors + 8];
+	int smooth_tmp[nb_sensors + 8];
+	int scale = 12;
 
 	/* values to calculate mean */
 	int pcum = 0, psum = 0;
 	int is_increasing = 0;
 
 	*fingers = 0;
-
-	/*
-	 * Use a smoothed version of sensor data for movement calculations, to
-	 * combat noise without needing to toss out values based on a threshold.
-	 * This improves tracking. Finger count is calculated seperately based
-	 * on raw data.
-	 */
-
-	for (i = 0; i < nb_sensors; i++) {           /* Scale up to minimize */
-		smooth[i] = xy_sensors[i] << 12;     /* rounding/truncation. */
-		//printk(KERN_DEBUG "%3d: %3d\n", i, smooth[i]);
-	}
-
-	for (k = 0; k < 4; k++) {
-
-		smooth_tmp[0] = (smooth[0] * 3 + smooth[1]) >> 2;
-
-		for (i = 1; i < nb_sensors-1; i++) {   /* Blend with neighbors. */
-			smooth_tmp[i] = (smooth[i - 1] + smooth[i] * 2 + smooth[i + 1]) >> 2;
-		}
-
-		smooth_tmp[nb_sensors - 1] = (smooth[nb_sensors - 1] * 3 + smooth[nb_sensors - 2]) >> 2;
-
-		for (i = 0; i < nb_sensors; i++) {
-			smooth[i] = smooth_tmp[i];
-			if (k == 3)     /* Last go-round, so scale back down. */
-				smooth[i] = smooth[i] >> 12;  
-		}
-	}
 
 	for (i = 0; i < nb_sensors; i++) {
 		if (xy_sensors[i] < threshold) {
@@ -405,13 +371,52 @@ static int atp_calculate_abs(int *xy_sensors, int nb_sensors, int fact,
 		} else if (i > 0 && (xy_sensors[i - 1] - xy_sensors[i] > threshold)) {
 			is_increasing = 0;
 		}
+	}
 
-		pcum += (smooth[i]) * i;
-		psum += (smooth[i]);
+	/*
+	 * Use a smoothed version of sensor data for movement calculations, to
+	 * combat noise without needing to rely so heavily on a threshold.
+	 * This improves tracking.
+	 *
+	 * The smoothed array is bigger than the original so that the smoothing
+	 * doesn't result in edge values being truncated.
+	 */
+
+	for (i = 0; i < 4; i++)
+		smooth[i] = 0;
+	for (i = nb_sensors + 4; i < nb_sensors + 8; i++)
+		smooth[i] = 0;
+
+	/* Pull base values, scaled up to help avoid truncation errors. */
+
+	for (i = 0; i < nb_sensors; i++)
+		smooth[i + 4] = xy_sensors[i] << scale;
+
+	for (k = 0; k < 4; k++) {
+
+		/* Handle edge. */
+		smooth_tmp[0] = (smooth[0] + smooth[1]) >> 1;
+
+		/* Average values with neighbors. */
+		for (i = 1; i < nb_sensors + 7; i++)
+			smooth_tmp[i] = (smooth[i - 1] + smooth[i] * 2 + smooth[i + 1]) >> 2;
+
+		/* Handle other edge. */
+		smooth_tmp[nb_sensors + 7] = (smooth[nb_sensors + 7] + smooth[nb_sensors + 6]) >> 1;
+
+		for (i = 0; i < nb_sensors + 8; i++)
+			smooth[i] = smooth_tmp[i];
+	}
+
+	for (i = 0; i < nb_sensors + 8; i++) {
+		if ((smooth[i] >> scale) > 0) {  /* Skip individual values if */
+			pcum += (smooth[i]) * i; /* they are small enough to  */
+			psum += (smooth[i]);     /* be truncated to 0 by our  */
+		}                                /* scale; mostly just noise. */
 	}
 
 	if (psum > 0) {
-		*z = psum;
+		*z = psum >> scale;            /* Scale down pressure output. */
 		return pcum * fact / psum;
 	}
 
@@ -488,7 +493,7 @@ static void atp_detect_size(struct atp *dev)
 			input_set_abs_params(dev->input, ABS_X, 0,
 					     (dev->info->xsensors_17 - 1) *
 							dev->info->xfact - 1,
-					     fuzz, 0);
+					     dev->info->fuzz, 0);
 			break;
 		}
 	}
@@ -504,8 +509,7 @@ static void atp_complete_geyser_1_2(struct urb *urb)
 {
 	int x, y, x_z, y_z, x_f, y_f;
 	int retval, i, j;
-	int key;
-	int fingers;
+	int key, fingers;
 	struct atp *dev = urb->context;
 	int status = atp_status_check(urb);
 
@@ -615,6 +619,7 @@ static void atp_complete_geyser_1_2(struct urb *urb)
 	} else if (!x && !y) {
 
 		dev->x_old = dev->y_old = -1;
+		dev->fingers_old = 0;
 		input_report_key(dev->input, BTN_TOUCH, 0);
 		input_report_abs(dev->input, ABS_PRESSURE, 0);
 		atp_report_fingers(dev->input, 0);
@@ -644,8 +649,7 @@ static void atp_complete_geyser_3_4(struct urb *urb)
 {
 	int x, y, x_z, y_z, x_f, y_f;
 	int retval, i, j;
-	int key;
-	int fingers;
+	int key, fingers;
 	struct atp *dev = urb->context;
 	int status = atp_status_check(urb);
 
@@ -734,6 +738,7 @@ static void atp_complete_geyser_3_4(struct urb *urb)
 	} else if (!x && !y) {
 
 		dev->x_old = dev->y_old = -1;
+		dev->fingers_old = 0;
 		input_report_key(dev->input, BTN_TOUCH, 0);
 		input_report_abs(dev->input, ABS_PRESSURE, 0);
 		atp_report_fingers(dev->input, 0);
@@ -855,11 +860,6 @@ static int atp_probe(struct usb_interface *iface,
 	dev->info = info;
 	dev->overflow_warned = false;
 
-	if (fuzz < 0)
-		fuzz = dev->info->fuzz;
-	if (threshold < 0)
-		threshold = dev->info->threshold;
-
 	dev->urb = usb_alloc_urb(0, GFP_KERNEL);
 	if (!dev->urb)
 		goto err_free_devs;
@@ -895,10 +895,10 @@ static int atp_probe(struct usb_interface *iface,
 
 	input_set_abs_params(input_dev, ABS_X, 0,
 			     (dev->info->xsensors - 1) * dev->info->xfact - 1,
-			     fuzz, 0);
+			     dev->info->fuzz, 0);
 	input_set_abs_params(input_dev, ABS_Y, 0,
 			     (dev->info->ysensors - 1) * dev->info->yfact - 1,
-			     fuzz, 0);
+			     dev->info->fuzz, 0);
 	input_set_abs_params(input_dev, ABS_PRESSURE, 0, ATP_PRESSURE, 0, 0);
 
 	set_bit(EV_KEY, input_dev->evbit);
