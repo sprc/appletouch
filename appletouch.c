@@ -161,6 +161,12 @@ MODULE_DEVICE_TABLE(usb, atp_table);
 #define ATP_XSENSORS	26
 #define ATP_YSENSORS	16
 
+/*
+ * The largest possible bank of sensors with additional buffer of 4 extra values
+ * on either side, for an array of smoothed sensor values.
+ */
+#define ATP_SMOOTHSIZE	34
+
 /* maximum pressure this driver will report */
 #define ATP_PRESSURE	300
 
@@ -168,7 +174,13 @@ MODULE_DEVICE_TABLE(usb, atp_table);
  * Threshold for the touchpad sensors. Any change less than ATP_THRESHOLD is
  * ignored.
  */
-#define ATP_THRESHOLD	 5
+#define ATP_THRESHOLD	5
+
+/*
+ * How far we'll bitshift our sensor values before averaging them. Mitigates
+ * rounding errors.
+ */
+#define ATP_SCALE	12
 
 /* Geyser initialization constants */
 #define ATP_GEYSER_MODE_READ_REQUEST_ID		1
@@ -212,6 +224,8 @@ struct atp {
 	signed char		xy_cur[ATP_XSENSORS + ATP_YSENSORS];
 	signed char		xy_old[ATP_XSENSORS + ATP_YSENSORS];
 	int			xy_acc[ATP_XSENSORS + ATP_YSENSORS];
+	int			smooth[ATP_SMOOTHSIZE];
+	int			smooth_tmp[ATP_SMOOTHSIZE];
 	int			idlecount;	/* number of empty packets */
 	struct work_struct	work;
 };
@@ -330,13 +344,14 @@ static void atp_reinit(struct work_struct *work)
 			retval);
 }
 
-static int atp_calculate_abs(int *xy_sensors, int nb_sensors, int fact,
-			     int *z, int *fingers)
+static int atp_calculate_abs(struct atp *dev, int offset, int nb_sensors,
+			     int fact, int *z, int *fingers)
 {
 	int i, k;
-	int smooth[nb_sensors + 8];
-	int smooth_tmp[nb_sensors + 8];
-	int scale = 12;
+
+	/* Use offset to point xy_sensors at the first value in dev->xy_acc   */
+	/* for whichever dimension we're looking at this particular go-round. */
+	int *xy_sensors = dev->xy_acc + offset;
 
 	/* values to calculate mean */
 	int pcum = 0, psum = 0;
@@ -373,6 +388,9 @@ static int atp_calculate_abs(int *xy_sensors, int nb_sensors, int fact,
 		}
 	}
 
+	if (*fingers < 1)     /* No need to continue if no fingers are found. */
+		return 0;
+
 	/*
 	 * Use a smoothed version of sensor data for movement calculations, to
 	 * combat noise without needing to rely so heavily on a threshold.
@@ -382,41 +400,38 @@ static int atp_calculate_abs(int *xy_sensors, int nb_sensors, int fact,
 	 * doesn't result in edge values being truncated.
 	 */
 
-	for (i = 0; i < 4; i++)
-		smooth[i] = 0;
-	for (i = nb_sensors + 4; i < nb_sensors + 8; i++)
-		smooth[i] = 0;
+	memset(dev->smooth, 0, sizeof(dev->smooth));
+	memset(dev->smooth_tmp, 0, sizeof(dev->smooth_tmp));
 
 	/* Pull base values, scaled up to help avoid truncation errors. */
 
 	for (i = 0; i < nb_sensors; i++)
-		smooth[i + 4] = xy_sensors[i] << scale;
+		dev->smooth[i + 4] = xy_sensors[i] << ATP_SCALE;
 
 	for (k = 0; k < 4; k++) {
-
 		/* Handle edge. */
-		smooth_tmp[0] = (smooth[0] + smooth[1]) >> 1;
+		dev->smooth_tmp[0] = (dev->smooth[0] + dev->smooth[1]) >> 1;
 
 		/* Average values with neighbors. */
 		for (i = 1; i < nb_sensors + 7; i++)
-			smooth_tmp[i] = (smooth[i - 1] + smooth[i] * 2 + smooth[i + 1]) >> 2;
+			dev->smooth_tmp[i] = (dev->smooth[i - 1] + dev->smooth[i] * 2 + dev->smooth[i + 1]) >> 2;
 
 		/* Handle other edge. */
-		smooth_tmp[nb_sensors + 7] = (smooth[nb_sensors + 7] + smooth[nb_sensors + 6]) >> 1;
+		dev->smooth_tmp[nb_sensors + 7] = (dev->smooth[nb_sensors + 7] + dev->smooth[nb_sensors + 6]) >> 1;
 
 		for (i = 0; i < nb_sensors + 8; i++)
-			smooth[i] = smooth_tmp[i];
+			dev->smooth[i] = dev->smooth_tmp[i];
 	}
 
 	for (i = 0; i < nb_sensors + 8; i++) {
-		if ((smooth[i] >> scale) > 0) {  /* Skip individual values if */
-			pcum += (smooth[i]) * i; /* they are small enough to  */
-			psum += (smooth[i]);     /* be truncated to 0 by our  */
-		}                                /* scale; mostly just noise. */
+		if ((dev->smooth[i] >> ATP_SCALE) > 0) {  /* Skip values if   */
+			pcum += (dev->smooth[i]) * i; /* they're small enough */
+			psum += (dev->smooth[i]);     /* to be truncated to 0 */
+		}                                  /* by scale. Mostly noise. */
 	}
 
 	if (psum > 0) {
-		*z = psum >> scale;            /* Scale down pressure output. */
+		*z = psum >> ATP_SCALE;        /* Scale down pressure output. */
 		return pcum * fact / psum;
 	}
 
@@ -586,10 +601,10 @@ static void atp_complete_geyser_1_2(struct urb *urb)
 
 	dbg_dump("accumulator", dev->xy_acc);
 
-	x = atp_calculate_abs(dev->xy_acc, ATP_XSENSORS,
-			      dev->info->xfact, &x_z, &x_f);
-	y = atp_calculate_abs(dev->xy_acc + ATP_XSENSORS, ATP_YSENSORS,
-			      dev->info->yfact, &y_z, &y_f);
+	x = atp_calculate_abs(dev, 0, ATP_XSENSORS, dev->info->xfact,
+			      &x_z, &x_f);
+	y = atp_calculate_abs(dev, ATP_XSENSORS, ATP_YSENSORS, dev->info->yfact,
+			      &y_z, &y_f);
 	key = dev->data[dev->info->datalen - 1] & ATP_STATUS_BUTTON;
 
 	fingers = max(x_f, y_f);
@@ -705,10 +720,11 @@ static void atp_complete_geyser_3_4(struct urb *urb)
 
 	dbg_dump("accumulator", dev->xy_acc);
 
-	x = atp_calculate_abs(dev->xy_acc, ATP_XSENSORS,
-			      dev->info->xfact, &x_z, &x_f);
-	y = atp_calculate_abs(dev->xy_acc + ATP_XSENSORS, ATP_YSENSORS,
-			      dev->info->yfact, &y_z, &y_f);
+	x = atp_calculate_abs(dev, 0, ATP_XSENSORS, dev->info->xfact,
+			      &x_z, &x_f);
+	y = atp_calculate_abs(dev, ATP_XSENSORS, ATP_YSENSORS, dev->info->yfact,
+			      &y_z, &y_f);
+
 	key = dev->data[dev->info->datalen - 1] & ATP_STATUS_BUTTON;
 
 	fingers = max(x_f, y_f);
