@@ -347,10 +347,12 @@ static void atp_reinit(struct work_struct *work)
 static int atp_calculate_abs(struct atp *dev, int offset, int nb_sensors,
 			     int fact, int *z, int *fingers)
 {
-	int i, k;
+	int i, pass;
 
-	/* Use offset to point xy_sensors at the first value in dev->xy_acc   */
-	/* for whichever dimension we're looking at this particular go-round. */
+	/*
+	 * Use offset to point xy_sensors at the first value in dev->xy_acc
+	 * for whichever dimension we're looking at this particular go-round.
+	 */
 	int *xy_sensors = dev->xy_acc + offset;
 
 	/* values to calculate mean */
@@ -400,34 +402,37 @@ static int atp_calculate_abs(struct atp *dev, int offset, int nb_sensors,
 	 * doesn't result in edge values being truncated.
 	 */
 
-	memset(dev->smooth, 0, sizeof(dev->smooth));
-	memset(dev->smooth_tmp, 0, sizeof(dev->smooth_tmp));
-
+	memset(dev->smooth, 0, 4 * sizeof(dev->smooth[0]));
 	/* Pull base values, scaled up to help avoid truncation errors. */
-
 	for (i = 0; i < nb_sensors; i++)
 		dev->smooth[i + 4] = xy_sensors[i] << ATP_SCALE;
+	memset(&dev->smooth[nb_sensors + 4], 0, 4 * sizeof(dev->smooth[0]));
 
-	for (k = 0; k < 4; k++) {
+	for (pass = 0; pass < 4; pass++) {
 		/* Handle edge. */
-		dev->smooth_tmp[0] = (dev->smooth[0] + dev->smooth[1]) >> 1;
+		dev->smooth_tmp[0] = (dev->smooth[0] + dev->smooth[1]) / 2;
 
 		/* Average values with neighbors. */
 		for (i = 1; i < nb_sensors + 7; i++)
-			dev->smooth_tmp[i] = (dev->smooth[i - 1] + dev->smooth[i] * 2 + dev->smooth[i + 1]) >> 2;
+			dev->smooth_tmp[i] = (dev->smooth[i - 1] +
+					      dev->smooth[i] * 2 +
+					      dev->smooth[i + 1]) / 4;
 
 		/* Handle other edge. */
-		dev->smooth_tmp[nb_sensors + 7] = (dev->smooth[nb_sensors + 7] + dev->smooth[nb_sensors + 6]) >> 1;
+		dev->smooth_tmp[i] = (dev->smooth[i - 1] + dev->smooth[i]) / 2;
 
-		for (i = 0; i < nb_sensors + 8; i++)
-			dev->smooth[i] = dev->smooth_tmp[i];
+		memcpy(dev->smooth, dev->smooth_tmp, sizeof(dev->smooth));
 	}
 
 	for (i = 0; i < nb_sensors + 8; i++) {
-		if ((dev->smooth[i] >> ATP_SCALE) > 0) {  /* Skip values if   */
-			pcum += (dev->smooth[i]) * i; /* they're small enough */
-			psum += (dev->smooth[i]);     /* to be truncated to 0 */
-		}                                  /* by scale. Mostly noise. */
+		/*
+		 * Skip values if they're small enough to be truncated to 0
+		 * by scale. Mostly noise.
+		 */
+		if ((dev->smooth[i] >> ATP_SCALE) > 0) {
+			pcum += dev->smooth[i] * i;
+			psum += dev->smooth[i];
+		}
 	}
 
 	if (psum > 0) {
@@ -601,15 +606,15 @@ static void atp_complete_geyser_1_2(struct urb *urb)
 
 	dbg_dump("accumulator", dev->xy_acc);
 
-	x = atp_calculate_abs(dev, 0, ATP_XSENSORS, dev->info->xfact,
-			      &x_z, &x_f);
-	y = atp_calculate_abs(dev, ATP_XSENSORS, ATP_YSENSORS, dev->info->yfact,
-			      &y_z, &y_f);
+	x = atp_calculate_abs(dev, 0, ATP_XSENSORS,
+			      dev->info->xfact, &x_z, &x_f);
+	y = atp_calculate_abs(dev, ATP_XSENSORS, ATP_YSENSORS,
+			      dev->info->yfact, &y_z, &y_f);
 	key = dev->data[dev->info->datalen - 1] & ATP_STATUS_BUTTON;
 
 	fingers = max(x_f, y_f);
 
-	if (x && y && (fingers == dev->fingers_old)) {
+	if (x && y && fingers == dev->fingers_old) {
 		if (dev->x_old != -1) {
 			x = (dev->x_old * 7 + x) >> 3;
 			y = (dev->y_old * 7 + y) >> 3;
@@ -720,16 +725,16 @@ static void atp_complete_geyser_3_4(struct urb *urb)
 
 	dbg_dump("accumulator", dev->xy_acc);
 
-	x = atp_calculate_abs(dev, 0, ATP_XSENSORS, dev->info->xfact,
-			      &x_z, &x_f);
-	y = atp_calculate_abs(dev, ATP_XSENSORS, ATP_YSENSORS, dev->info->yfact,
-			      &y_z, &y_f);
+	x = atp_calculate_abs(dev, 0, ATP_XSENSORS,
+			      dev->info->xfact, &x_z, &x_f);
+	y = atp_calculate_abs(dev, ATP_XSENSORS, ATP_YSENSORS,
+			      dev->info->yfact, &y_z, &y_f);
 
 	key = dev->data[dev->info->datalen - 1] & ATP_STATUS_BUTTON;
 
 	fingers = max(x_f, y_f);
 
-	if (x && y && (fingers == dev->fingers_old)) {
+	if (x && y && fingers == dev->fingers_old) {
 		if (dev->x_old != -1) {
 			x = (dev->x_old * 7 + x) >> 3;
 			y = (dev->y_old * 7 + y) >> 3;
