@@ -5,9 +5,9 @@ Linux kernel driver for Apple touchpads - 05 Powerbooks - 08 Macbooks. Newer dev
 
 This repo contains changes I helped get into 3.15 rc1. If you are on an older kernel and would like to try the patch early can git clone or download and extract it, then:
 
-make
-sudo rmmod appletouch
-sudo insmod appletouch.ko
+	make
+	sudo rmmod appletouch
+	sudo insmod appletouch.ko
 
 This persists until reboot.
 
